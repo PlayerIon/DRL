@@ -48,6 +48,12 @@ class NFQ:
             state = torch.FloatTensor(state).to(self.config.device)
             q_values = self.q_net(state)
             return torch.argmax(q_values).item()
+
+    def select_greedy_action(self, state):
+        with torch.no_grad():
+            state = torch.FloatTensor(state).to(self.config.device)
+            q_values = self.q_net(state)
+            return torch.argmax(q_values).item()
         
     def update(self, state, action, reward, next_state, done):
         # 将数据转换为tensor并移到设备上
@@ -110,7 +116,7 @@ class NFQ:
                 state, _ = env.reset()
                 episode_reward = 0
                 for step in range(max_steps):
-                    action = self.select_action(state)
+                    action = self.select_greedy_action(state)
                     next_state, reward, done, _, _ = env.step(action)
                     state = next_state
                     episode_reward += reward

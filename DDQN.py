@@ -1,4 +1,4 @@
-# 增加了目标网络,使用自适应epsilon衰减
+# 使用DDQN算法，使用梯度裁剪
 
 import numpy as np
 import gymnasium as gym
@@ -18,9 +18,11 @@ class Config:
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.hidden_dims = [64, 64]
         self.batch_size = 32
-        self.replay_buffer_size = 2000
+        self.replay_buffer_size = 10000
+        self.target_update_freq = 2
         self.update_freq = 1
         self.tau = 0.005
+
 
 class ReplayBuffer:
     def __init__(self, max_size):
@@ -30,11 +32,18 @@ class ReplayBuffer:
     def push(self, state, action, reward, next_state, done):
         if len(self.buffer) >= self.max_size:
             self.buffer.pop(0)
+        state = np.array(state, dtype=np.float32)
+        next_state = np.array(next_state, dtype=np.float32)
         self.buffer.append((state, action, reward, next_state, done))
     
     def sample(self, batch_size):
         batch = random.sample(self.buffer, batch_size)
         states, actions, rewards, next_states, dones = zip(*batch)
+        states = np.array(states, dtype=np.float32)
+        next_states = np.array(next_states, dtype=np.float32)
+        actions = np.array(actions, dtype=np.int64)
+        rewards = np.array(rewards, dtype=np.float32)
+        dones = np.array(dones, dtype=np.bool_)
         return states, actions, rewards, next_states, dones
     
     def __len__(self):
@@ -71,36 +80,38 @@ class DQN:
         if np.random.rand() < self.config.epsilon:
             return self.env.action_space.sample()
         with torch.no_grad():
-            state = torch.FloatTensor(state).to(self.config.device)
+            state = torch.from_numpy(np.array(state, dtype=np.float32)).unsqueeze(0).to(self.config.device)
             q_values = self.q_net(state)
             return torch.argmax(q_values).item()
 
     def select_greedy_action(self, state):
         with torch.no_grad():
-            state = torch.FloatTensor(state).to(self.config.device)
+            state = torch.from_numpy(np.array(state, dtype=np.float32)).unsqueeze(0).to(self.config.device)
             q_values = self.q_net(state)
             return torch.argmax(q_values).item()
 
+        
     def update(self, batch):
         states, actions, rewards, next_states, dones = batch
-        # 将数据转换为tensor并移到设备上
-        states = torch.FloatTensor(states).to(self.config.device)
-        actions = torch.LongTensor(actions).to(self.config.device)
-        rewards = torch.FloatTensor(rewards).to(self.config.device)
-        next_states = torch.FloatTensor(next_states).to(self.config.device)
-        dones = torch.BoolTensor(dones).to(self.config.device)
+        states = torch.from_numpy(states).float().to(self.config.device)
+        actions = torch.from_numpy(actions).long().to(self.config.device)
+        rewards = torch.from_numpy(rewards).float().to(self.config.device)
+        next_states = torch.from_numpy(next_states).float().to(self.config.device)
+        dones = torch.from_numpy(dones).bool().to(self.config.device)
 
         current_q_values = self.q_net(states)
         current_q = current_q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
 
         with torch.no_grad():
-            next_q_values = self.target_q_net(next_states)
-            max_next_q = next_q_values.max(1)[0]
+            next_actions = self.q_net(next_states).argmax(1)
+            max_next_q = self.target_q_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
             target_q = rewards + (self.config.gamma * max_next_q * (~dones).float())
 
         loss = nn.MSELoss()(current_q, target_q)
         self.optimizer.zero_grad()
         loss.backward()
+        # 添加梯度裁剪
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), max_norm=1.0)
         self.optimizer.step()
         return loss.item()
         
@@ -110,31 +121,39 @@ class DQN:
 
     def train(self, episodes=1000, max_steps=1000):
         rewards = []
+        losses = []
         step_count = 0
         for episode in range(episodes):
             state, _ = self.env.reset()
             episode_reward = 0
+            episode_loss = 0
+            update_count = 0
             for step in range(max_steps):
                 action = self.select_action(state)
                 next_state, reward, done, _, _ = self.env.step(action)
                 self.replay_buffer.push(state, action, reward, next_state, done)
                 if step_count % self.config.update_freq == 0 and len(self.replay_buffer) > self.config.batch_size:
                     batch = self.replay_buffer.sample(self.config.batch_size)
-                    self.update(batch)
+                    loss = self.update(batch)
+                    episode_loss += loss
+                    update_count += 1
                 state = next_state
                 episode_reward += reward
                 step_count += 1
-                self.update_target_network()
+                if step_count % self.config.target_update_freq == 0:
+                    self.update_target_network()
                 if done:
                     break
             rewards.append(episode_reward)
-            print(f"Episode {episode} - Reward: {episode_reward} - Epsilon: {round(self.config.epsilon, 3)}")
+            avg_loss = episode_loss / max(update_count, 1)
+            losses.append(avg_loss)
+            print(f"Episode {episode} - Reward: {episode_reward} - Epsilon: {round(self.config.epsilon, 3)} - Avg Loss: {avg_loss:.4f}")
             self.adaptive_epsilon_decay(episode, episodes)
-        return rewards
+        return rewards, losses
     
     def adaptive_epsilon_decay(self, episode, episodes):
         progress = episode / episodes
-        self.config.epsilon = self.config.epsilon_min + (self.config.epsilon_max - self.config.epsilon_min) * (1 - progress)
+        self.config.epsilon = self.config.epsilon_max - (self.config.epsilon_max - self.config.epsilon_min) * progress
 
     def save(self, path):
         torch.save(self.q_net.state_dict(), path)
@@ -164,7 +183,22 @@ if __name__ == "__main__":
     test_env = gym.make("CartPole-v1", render_mode="human")
     config = Config()
     agent = DQN(train_env, config)
-    rewards = agent.train(episodes=600, max_steps=1000)
-    plt.plot(rewards)
+    rewards, losses = agent.train(episodes=2000, max_steps=1000)
+    
+    # 绘制奖励和损失曲线
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+    
+    ax1.plot(rewards)
+    ax1.set_title('Training Rewards')
+    ax1.set_xlabel('Episode')
+    ax1.set_ylabel('Reward')
+    
+    ax2.plot(losses)
+    ax2.set_title('Training Loss')
+    ax2.set_xlabel('Episode')
+    ax2.set_ylabel('Loss')
+    
+    plt.tight_layout()
     plt.show()
+    
     agent.evaluate(test_env, episodes=10, max_steps=1000)
