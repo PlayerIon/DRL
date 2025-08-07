@@ -1,4 +1,4 @@
-# 简单版本的NFQ
+# 增加了经验回放,使用batch训练
 
 import numpy as np
 import gymnasium as gym
@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
+import random
 
 class Config:
     def __init__(self):
@@ -16,6 +17,27 @@ class Config:
         self.epsilon_min = 0.01
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.hidden_dims = [64, 64]
+        self.batch_size = 32
+        self.replay_buffer_size = 2000
+        self.update_freq = 1
+
+class ReplayBuffer:
+    def __init__(self, max_size):
+        self.buffer = []
+        self.max_size = max_size
+        
+    def push(self, state, action, reward, next_state, done):
+        if len(self.buffer) >= self.max_size:
+            self.buffer.pop(0)
+        self.buffer.append((state, action, reward, next_state, done))
+    
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        states, actions, rewards, next_states, dones = zip(*batch)
+        return states, actions, rewards, next_states, dones
+    
+    def __len__(self):
+        return len(self.buffer)
 
 
 class MLP(nn.Module):
@@ -40,6 +62,7 @@ class NFQ:
         self.action_dim = env.action_space.n
         self.q_net = MLP(self.state_dim, self.config.hidden_dims, self.action_dim).to(self.config.device)
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.config.lr)
+        self.replay_buffer = ReplayBuffer(max_size=self.config.replay_buffer_size)
 
     def select_action(self, state):
         if np.random.rand() < self.config.epsilon:
@@ -49,49 +72,50 @@ class NFQ:
             q_values = self.q_net(state)
             return torch.argmax(q_values).item()
         
-    def update(self, state, action, reward, next_state, done):
+    def update(self, batch):
+        states, actions, rewards, next_states, dones = batch
         # 将数据转换为tensor并移到设备上
-        state = torch.FloatTensor(state).unsqueeze(0).to(self.config.device)
-        next_state = torch.FloatTensor(next_state).unsqueeze(0).to(self.config.device)
-        action = torch.LongTensor([action]).to(self.config.device)
-        reward = torch.FloatTensor([reward]).to(self.config.device)
-        done = torch.BoolTensor([done]).to(self.config.device)
-        
-        # 计算当前Q值
-        current_q_values = self.q_net(state)
-        current_q = current_q_values.gather(1, action.unsqueeze(1)).squeeze(1)
-        
-        # 计算目标Q值
+        states = torch.FloatTensor(states).to(self.config.device)
+        actions = torch.LongTensor(actions).to(self.config.device)
+        rewards = torch.FloatTensor(rewards).to(self.config.device)
+        next_states = torch.FloatTensor(next_states).to(self.config.device)
+        dones = torch.BoolTensor(dones).to(self.config.device)
+
+        current_q_values = self.q_net(states)
+        current_q = current_q_values.gather(1, actions.unsqueeze(1)).squeeze(1)
+
         with torch.no_grad():
-            next_q_values = self.q_net(next_state)
+            next_q_values = self.q_net(next_states)
             max_next_q = next_q_values.max(1)[0]
-            target_q = reward + (self.config.gamma * max_next_q * (~done).float())
-        
-        # 计算损失
+            target_q = rewards + (self.config.gamma * max_next_q * (~dones).float())
+
         loss = nn.MSELoss()(current_q, target_q)
-        
-        # 反向传播和优化
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
-        
         return loss.item()
-    
+        
+
     def train(self, episodes=1000, max_steps=1000):
         rewards = []
+        step_count = 0
         for episode in range(episodes):
             state, _ = self.env.reset()
             episode_reward = 0
             for step in range(max_steps):
                 action = self.select_action(state)
                 next_state, reward, done, _, _ = self.env.step(action)
-                self.update(state, action, reward, next_state, done)
+                self.replay_buffer.push(state, action, reward, next_state, done)
+                if step_count % self.config.update_freq == 0 and len(self.replay_buffer) > self.config.batch_size:
+                    batch = self.replay_buffer.sample(self.config.batch_size)
+                    self.update(batch)
                 state = next_state
                 episode_reward += reward
+                step_count += 1
                 if done:
                     break
             rewards.append(episode_reward)
-            print(f"Episode {episode} - Reward: {episode_reward} - Epsilon: {self.config.epsilon}")
+            print(f"Episode {episode} - Reward: {episode_reward} - Epsilon: {round(self.config.epsilon, 3)}")
             self.config.epsilon = max(self.config.epsilon_min, self.config.epsilon * self.config.epsilon_decay)
         return rewards
 
