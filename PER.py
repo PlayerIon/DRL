@@ -1,4 +1,4 @@
-# 使用DDQN
+# 优先经验回放
 
 import numpy as np
 import gymnasium as gym
@@ -24,47 +24,98 @@ class Config:
         self.target_update_freq = 5
         self.tau = 0.005
 
-class ReplayBuffer:
-    def __init__(self, max_size):
+        self.per_alpha = 0.6
+        self.per_beta = 0.4
+        self.per_beta_increment = 0.001
+        self.per_epsilon = 1e-6
+
+class PrioritizedReplayBuffer:
+    def __init__(self, max_size, alpha=0.6, beta=0.4, beta_increment=0.001, epsilon=1e-6):
         self.buffer = deque(maxlen=max_size)
-        
-    def push(self, state, action, reward, next_state, done):
+        self.priorities = deque(maxlen=max_size)
+        self.alpha = alpha
+        self.beta = beta
+        self.beta_increment = beta_increment
+        self.epsilon = epsilon
+        self.size = 0
+        self.max_priority = 1.0
+
+    def push(self, state, action, reward, next_state, done, priority=None):
+        if priority is None:
+            priority = self.max_priority if self.size > 0 else 1.0
+        self.max_priority = max(self.max_priority, priority)
         self.buffer.append((state, action, reward, next_state, done))
-    
+        self.priorities.append(priority)
+
     def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
+        size = len(self.buffer)
+        batch_size = min(batch_size, size)
+        priorities = list(self.priorities)
+        probabilities = np.array(priorities) ** self.alpha
+        probabilities /= probabilities.sum()
+
+        indices = np.random.choice(size, batch_size, p=probabilities)
+        weights = (size * probabilities[indices]) ** -self.beta
+        weights /= weights.max()
+
+        batch = [self.buffer[i] for i in indices]
         states, actions, rewards, next_states, dones = zip(*batch)
-        return states, actions, rewards, next_states, dones
+
+        self.beta = min(1.0, self.beta + self.beta_increment)
+
+        return states, actions, rewards, next_states, dones, weights, indices
+    
+    def update_priorities(self, indices, priorities):
+        for i, priority in zip(indices, priorities):
+            self.priorities[i] = priority + self.epsilon
     
     def __len__(self):
         return len(self.buffer)
 
 
-class MLP(nn.Module):
+class DuelingMLP(nn.Module):
     def __init__(self, input_dim, hidden_dims, output_dim, activation=nn.ReLU()):
-        super(MLP, self).__init__()
-        layers = []
-        dims = [input_dim] + hidden_dims + [output_dim]
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i+1]))
-            if i < len(dims) - 2:
-                layers.append(activation)
-        self.model = nn.Sequential(*layers)
+        super(DuelingMLP, self).__init__()
+
+        self.feature_layer = nn.Sequential(
+            nn.Linear(input_dim, hidden_dims[0]),
+            nn.ReLU(),
+        )
+        self.value_layer = nn.Sequential(
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[1], 1),
+        )
+        self.advantage_layer = nn.Sequential(
+            nn.Linear(hidden_dims[0], hidden_dims[1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[1], output_dim),
+        )
 
     def forward(self, x):
-        return self.model(x)
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+
+        feature = self.feature_layer(x)
+        value = self.value_layer(feature)
+        advantage = self.advantage_layer(feature)
+
+        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+
+        return q_values
     
-class DDQN:
+class DuelingDDQN:
     def __init__(self, env, config):
         self.env = env
         self.config = config
         self.state_dim = env.observation_space.shape[0]
         self.action_dim = env.action_space.n
-        self.q_net = MLP(self.state_dim, self.config.hidden_dims, self.action_dim).to(self.config.device)
-        self.target_q_net = MLP(self.state_dim, self.config.hidden_dims, self.action_dim).to(self.config.device)
+        self.q_net = DuelingMLP(self.state_dim, self.config.hidden_dims, self.action_dim).to(self.config.device)
+        self.target_q_net = DuelingMLP(self.state_dim, self.config.hidden_dims, self.action_dim).to(self.config.device)
         self.target_q_net.load_state_dict(self.q_net.state_dict())
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.config.lr)
-        self.replay_buffer = ReplayBuffer(max_size=self.config.replay_buffer_size)
+        self.replay_buffer = PrioritizedReplayBuffer(max_size=self.config.replay_buffer_size, alpha=self.config.per_alpha, \
+             beta=self.config.per_beta, beta_increment=self.config.per_beta_increment, epsilon=self.config.per_epsilon)
 
     def select_action(self, state):
         if np.random.rand() < self.config.epsilon:
@@ -81,7 +132,7 @@ class DDQN:
             return torch.argmax(q_values).item()
 
     def update(self, batch):
-        states, actions, rewards, next_states, dones = batch
+        states, actions, rewards, next_states, dones, weights, indices = batch
         # 将数据转换为tensor并移到设备上
         states = torch.FloatTensor(states).to(self.config.device)
         actions = torch.LongTensor(actions).to(self.config.device)
@@ -97,10 +148,17 @@ class DDQN:
             max_next_q = self.target_q_net(next_states).gather(1, next_actions.unsqueeze(1)).squeeze(1)
             target_q = rewards + (self.config.gamma * max_next_q * (~dones).float())
 
-        loss = nn.MSELoss()(current_q, target_q)
+        td_errors = torch.abs(target_q - current_q).detach()
+
+        weights = torch.FloatTensor(weights).to(self.config.device)
+        loss = (weights * nn.MSELoss()(current_q, target_q)).mean()
+
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+        self.replay_buffer.update_priorities(indices, td_errors.cpu().numpy())
+
         return loss.item()
         
     def update_target_network(self):
@@ -163,7 +221,7 @@ if __name__ == "__main__":
     train_env = gym.make("CartPole-v1")
     test_env = gym.make("CartPole-v1", render_mode="human")
     config = Config()
-    agent = DDQN(train_env, config)
+    agent = DuelingDDQN(train_env, config)
     rewards = agent.train(episodes=600, max_steps=1000)
     plt.plot(rewards)
     plt.show()
